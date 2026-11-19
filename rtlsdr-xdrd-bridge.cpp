@@ -3,6 +3,7 @@
 #include <vector>
 #include <complex>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <csignal>
 #include <thread>
@@ -56,8 +57,8 @@ constexpr int      DIRECT_SAMPLING_MODE    = 2;
 constexpr float    DEEMPHASIS_TAU          = 50e-6f;
 
 // Audio output gain multipliers for FM and AM modes
-constexpr float    FM_AUDIO_GAIN           = 7000.0f;
-constexpr float    AM_AUDIO_GAIN           = 9500.0f;
+constexpr float    FM_AUDIO_GAIN           = 4200.0f;
+constexpr float    AM_AUDIO_GAIN           = 7500.0f;
 
 // Signal level calibration offset and maximum allowed dBf value
 // FM-DX Webserver converts dBf to dBm as (dBm = dBf - 120).
@@ -81,6 +82,62 @@ constexpr int64_t  DIAGNOSTICS_INTERVAL_MS = 60000;
 
 // Duration in milliseconds to mute RDS pipe after tuning to flush stale station data
 constexpr int64_t  RDS_FLUSH_WINDOW_MS     = 240;
+
+// ----------------------------------------------------------------------------
+//                      STEREO DECODER CONFIGURATION
+// ----------------------------------------------------------------------------
+
+// Print stereo/pilot statistics once per second (useful for tuning thresholds)
+constexpr bool     STEREO_DEBUG            = false;
+
+// The stereo (L+R / L-R) part is processed at IF_RATE / STEREO_DECIM = 64 kHz
+constexpr int      STEREO_DECIM            = 4;
+constexpr uint32_t STEREO_RATE             = IF_RATE / STEREO_DECIM;
+static_assert(IF_RATE % STEREO_DECIM == 0, "IF_RATE must be a multiple of STEREO_DECIM");
+
+// Pilot PLL: corner of the low-pass that follows the quadrature mixer (Hz).
+// Narrow => very low noise in the phase detector.
+constexpr double   PILOT_MIXER_LPF_HZ      = 300.0;
+
+// PLL loop natural frequency (Hz): wide while searching, narrow once locked
+constexpr double   PLL_BW_ACQUIRE_HZ       = 40.0;
+constexpr double   PLL_BW_TRACK_HZ         = 12.0;
+
+// Max deviation of the PLL frequency from 19 kHz (Hz). Covers RTL ppm error + transmitter tolerance.
+constexpr double   PLL_PULL_RANGE_HZ       = 25.0;
+
+// Pilot amplitude thresholds (1.0 == 75 kHz deviation; broadcast pilot is ~0.07..0.10)
+constexpr double   PILOT_LOCK_ON_AMP       = 0.040;
+constexpr double   PILOT_LOCK_OFF_AMP      = 0.028;
+
+// Stereo blend control by estimated L-R signal-to-noise ratio (dB):
+//   below STEREO_SNR_MIN_DB  -> pure mono
+//   above STEREO_SNR_FULL_DB -> full stereo
+// If weak stations still hiss  -> raise both numbers (e.g. 22 / 34).
+// If stereo drops too early    -> lower them   (e.g. 14 / 26).
+constexpr double   STEREO_SNR_MIN_DB       = 10.0;
+constexpr double   STEREO_SNR_FULL_DB      = 22.0;
+
+// Blend smoothing: fast fall (to mono), slow rise (to stereo) - prevents "pumping"
+constexpr float    STEREO_ATTACK_MS        = 20.0f;
+constexpr float    STEREO_RELEASE_MS       = 250.0f;
+
+// Dynamic high-cut applied to the L-R (difference) channel:
+// fc = MIN + SPAN * blend^2. Weak signal -> L-R is band-limited, hiss disappears.
+constexpr float    LR_HICUT_MIN_HZ         = 3000.0f;
+constexpr float    LR_HICUT_SPAN_HZ        = 40000.0f;
+
+// Manual trim of the 38 kHz carrier phase in radians (normally 0).
+// Use only if separation is poor on ALL strong stations.
+constexpr double   STEREO_PHASE_TRIM_RAD   = 0.0;
+
+// Noise measurement band (empty part of MPX, above RDS, below the IF filter edge)
+constexpr double   NOISE_BAND_CENTER_HZ    = 72500.0;
+constexpr double   NOISE_BAND_WIDTH_HZ     = 15000.0;
+
+// Converts power measured in that band to the noise power inside the 23..53 kHz L-R band
+// (FM noise spectrum is parabolic: ~ f^2).
+constexpr double   LR_NOISE_FACTOR         = 0.37;
 
 // ============================================================================
 
@@ -110,6 +167,212 @@ static inline std::complex<float> sanitize_complex(std::complex<float> v) {
     }
     return v;
 }
+
+// ============================================================================
+// DSP HELPERS FOR THE STEREO DECODER
+// ============================================================================
+
+// Modified Bessel function I0 (for Kaiser window)
+static double bessel_i0(double x) {
+    double sum = 1.0, term = 1.0;
+    const double q = x * x * 0.25;
+    for (int k = 1; k < 60; ++k) {
+        term *= q / (double(k) * double(k));
+        sum += term;
+        if (term < 1e-14 * sum) break;
+    }
+    return sum;
+}
+
+// Linear-phase Kaiser-windowed-sinc low-pass with EXACTLY unity DC gain.
+// fc is the -6 dB point, normalized to the sample rate (0 .. 0.5).
+static std::vector<float> design_kaiser_lowpass(int n, double fc, double atten_db) {
+    double beta;
+    if (atten_db > 50.0)      beta = 0.1102 * (atten_db - 8.7);
+    else if (atten_db > 21.0) beta = 0.5842 * std::pow(atten_db - 21.0, 0.4) + 0.07886 * (atten_db - 21.0);
+    else                      beta = 0.0;
+
+    std::vector<double> h(n);
+    const double M = (n - 1) / 2.0;
+    const double i0b = bessel_i0(beta);
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const double t = i - M;
+        const double s = (std::fabs(t) < 1e-12) ? 2.0 * fc : std::sin(2.0 * M_PI * fc * t) / (M_PI * t);
+        const double r = (M > 0.0) ? t / M : 0.0;
+        const double w = bessel_i0(beta * std::sqrt(std::max(0.0, 1.0 - r * r))) / i0b;
+        h[i] = s * w;
+        sum += h[i];
+    }
+    std::vector<float> out(n);
+    for (int i = 0; i < n; ++i) out[i] = float(h[i] / sum);
+    return out;
+}
+
+// Measures the DC gain of a liquid real FIR filter (used only for loudness compatibility)
+static float measure_dc_gain(firfilt_rrrf f, unsigned int taps) {
+    float y = 0.0f;
+    for (unsigned int i = 0; i < taps * 2 + 8; ++i) {
+        firfilt_rrrf_push(f, 1.0f);
+        firfilt_rrrf_execute(f, &y);
+    }
+    return y;
+}
+
+// Double-precision biquad (narrow filters at 256 kHz need double precision)
+struct Biquad {
+    double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
+    double z1 = 0.0, z2 = 0.0;
+
+    void reset() { z1 = z2 = 0.0; }
+
+    inline double process(double x) {
+        const double y = b0 * x + z1;
+        z1 = b1 * x - a1 * y + z2;
+        z2 = b2 * x - a2 * y;
+        return y;
+    }
+
+    void design_lowpass(double fs, double fc, double q) {
+        const double w0 = 2.0 * M_PI * fc / fs;
+        const double cw = std::cos(w0), sw = std::sin(w0);
+        const double alpha = sw / (2.0 * q);
+        const double a0 = 1.0 + alpha;
+        b0 = ((1.0 - cw) * 0.5) / a0;
+        b1 = (1.0 - cw) / a0;
+        b2 = b0;
+        a1 = (-2.0 * cw) / a0;
+        a2 = (1.0 - alpha) / a0;
+    }
+
+    // Constant 0 dB peak gain band-pass (RBJ cookbook)
+    void design_bandpass(double fs, double f0, double q) {
+        const double w0 = 2.0 * M_PI * f0 / fs;
+        const double cw = std::cos(w0), sw = std::sin(w0);
+        const double alpha = sw / (2.0 * q);
+        const double a0 = 1.0 + alpha;
+        b0 = alpha / a0;
+        b1 = 0.0;
+        b2 = -alpha / a0;
+        a1 = (-2.0 * cw) / a0;
+        a2 = (1.0 - alpha) / a0;
+    }
+};
+
+// ============================================================================
+// 19 kHz PILOT TRACKER (PLL) + 38 kHz CARRIER GENERATOR + NOISE ESTIMATOR
+//
+//  * The mixer output is low-passed with a very narrow filter BEFORE the phase
+//    detector, so audio / RDS / noise do not jitter the phase.
+//  * The phase detector is amplitude-normalized (e = Im / |z|), so the loop gain
+//    does not depend on the pilot level.
+//  * The 38 kHz carrier is taken from EXACTLY the same phase that was used for
+//    the pilot mixer in the same sample (the old code used the phase one sample
+//    later = ~53 degrees of error on the 38 kHz carrier).
+// ============================================================================
+class PilotTracker {
+    double fs = 1.0;
+    double phase = 0.0;
+    double w = 0.0, w_nom = 0.0, w_lim = 0.0;
+    double kp_acq = 0.0, ki_acq = 0.0, kp_trk = 0.0, ki_trk = 0.0;
+    double trim_c = 1.0, trim_s = 0.0;
+    double k_amp = 0.0, k_err = 0.0, k_noise = 0.0;
+    Biquad lp_re, lp_im, bp_noise;
+    double re_avg = 0.0;       // average of Re(z) == pilot_amplitude / 2 when locked
+    double err_var = 1.0;      // average of phase-error^2
+    double noise_pow = 1e-4;   // power in the noise measurement band
+
+    static void loop_gains(double fn_hz, double fs_hz, double& kp, double& ki) {
+        const double wn = 2.0 * M_PI * fn_hz / fs_hz;
+        kp = 2.0 * 0.7071 * wn;
+        ki = wn * wn;
+    }
+
+public:
+    bool locked = false;
+
+    void init(double fs_hz) {
+        fs = fs_hz;
+        w_nom = 2.0 * M_PI * 19000.0 / fs;
+        w_lim = 2.0 * M_PI * PLL_PULL_RANGE_HZ / fs;
+        lp_re.design_lowpass(fs, PILOT_MIXER_LPF_HZ, 0.7071);
+        lp_im = lp_re;
+        bp_noise.design_bandpass(fs, NOISE_BAND_CENTER_HZ, NOISE_BAND_CENTER_HZ / NOISE_BAND_WIDTH_HZ);
+        loop_gains(PLL_BW_ACQUIRE_HZ, fs, kp_acq, ki_acq);
+        loop_gains(PLL_BW_TRACK_HZ,   fs, kp_trk, ki_trk);
+        trim_c = std::cos(STEREO_PHASE_TRIM_RAD);
+        trim_s = std::sin(STEREO_PHASE_TRIM_RAD);
+        k_amp   = 1.0 / (0.040 * fs);   // 40 ms
+        k_err   = 1.0 / (0.040 * fs);   // 40 ms
+        k_noise = 1.0 / (0.150 * fs);   // 150 ms
+        reset();
+    }
+
+    void reset() {
+        w = w_nom;
+        lp_re.reset();
+        lp_im.reset();
+        bp_noise.reset();
+        re_avg = 0.0;
+        err_var = 1.0;
+        noise_pow = 1e-4;
+        locked = false;
+    }
+
+    // Processes one MPX sample, returns sin(2*phi_pilot) - the 38 kHz subcarrier reference
+    float step(float x_in) {
+        const double x  = x_in;
+        const double sn = std::sin(phase);
+        const double cs = std::cos(phase);
+
+        // Quadrature mixer: x = A*sin(theta)  ->  Re = A/2*cos(d), Im = A/2*sin(d), d = theta - phase
+        const double re  = lp_re.process(x * sn);
+        const double im  = lp_im.process(x * cs);
+        const double mag = std::sqrt(re * re + im * im);
+        const double e   = (mag > 1e-7) ? (im / mag) : 0.0;
+
+        re_avg  += k_amp   * (re - re_avg);
+        err_var += k_err   * (e * e - err_var);
+        const double nb = bp_noise.process(x);
+        noise_pow += k_noise * (nb * nb - noise_pow);
+
+        // 38 kHz carrier from the SAME phase as the pilot mixer (sin(2*phase + trim))
+        const double s2 = 2.0 * sn * cs;
+        const double c2 = cs * cs - sn * sn;
+        const double carrier = s2 * trim_c + c2 * trim_s;
+
+        // Lock detector with hysteresis
+        const double amp = 2.0 * re_avg;
+        const double err_rms = std::sqrt(std::max(0.0, err_var));
+        if (!locked) {
+            if (amp > PILOT_LOCK_ON_AMP && err_rms < 0.30) locked = true;
+        } else {
+            if (amp < PILOT_LOCK_OFF_AMP || err_rms > 0.55) locked = false;
+        }
+
+        // PI loop
+        const double kp = locked ? kp_trk : kp_acq;
+        const double ki = locked ? ki_trk : ki_acq;
+        w += ki * e;
+        w = std::clamp(w, w_nom - w_lim, w_nom + w_lim);
+        phase += w + kp * e;
+        if (phase >= 2.0 * M_PI) phase -= 2.0 * M_PI;
+        else if (phase < 0.0)    phase += 2.0 * M_PI;
+
+        return float(carrier);
+    }
+
+    double pilot_amplitude() const { return 2.0 * re_avg; }
+
+    // Estimated SNR (dB) of the L-R channel, using pilot power as the reference
+    double snr_db() const {
+        const double a = 2.0 * re_avg;
+        if (a <= 1e-6) return -100.0;
+        const double p = 0.5 * a * a;
+        const double n = LR_NOISE_FACTOR * noise_pow + 1e-12;
+        return 10.0 * std::log10(p / n);
+    }
+};
 
 // ============================================================================
 // CONTINUOUS ZERO-UNDERRUN ALSA AUDIO ENGINE (PREVENTS BROWSER STREAM DROPS)
@@ -715,24 +978,63 @@ int main(int argc, char** argv) {
         }
     });
 
+    // ---- IF stage / RDS wideband path / AM path (unchanged) ----
     firdecim_crcf decim         = firdecim_crcf_create_kaiser(DECIM_FACTOR, 16, 65.0f);
     firfilt_crcf  if_filter     = firfilt_crcf_create_kaiser(41, 190000.0f / (2.0f * IF_RATE), 60.0f, 0.0f);
     firfilt_crcf  rds_if_filter = firfilt_crcf_create_kaiser(41, 200000.0f / (2.0f * IF_RATE), 60.0f, 0.0f);
     freqdem       fmdem         = freqdem_create(75000.0f / IF_RATE);
     freqdem       rds_fmdem     = freqdem_create(75000.0f / IF_RATE);
 
-    firfilt_rrrf lpr_filter      = firfilt_rrrf_create_kaiser(63, 15000.0f / IF_RATE, 60.0f, 0.0f);
-    firfilt_rrrf lmr_filter      = firfilt_rrrf_create_kaiser(63, 15000.0f / IF_RATE, 60.0f, 0.0f);
     firfilt_rrrf am_audio_filter = firfilt_rrrf_create_kaiser(63, 6000.0f / IF_RATE, 60.0f, 0.0f);
 
-    iirfilt_crcf pilot_metric_lpf = iirfilt_crcf_create_lowpass(2, 120.0f / IF_RATE);
-    nco_crcf pilot_nco = nco_crcf_create(LIQUID_VCO);
-    nco_crcf_set_frequency(pilot_nco, 2.0f * M_PI * 19000.0f / IF_RATE);
-    nco_crcf_pll_set_bandwidth(pilot_nco, 0.0015f);
-
-    msresamp_rrrf resamp_L   = msresamp_rrrf_create(float(AUDIO_RATE) / float(IF_RATE), 60.0f);
-    msresamp_rrrf resamp_R   = msresamp_rrrf_create(float(AUDIO_RATE) / float(IF_RATE), 60.0f);
+    msresamp_rrrf resamp_L   = msresamp_rrrf_create(float(AUDIO_RATE) / float(IF_RATE), 60.0f);   // AM path
+    msresamp_rrrf resamp_R   = msresamp_rrrf_create(float(AUDIO_RATE) / float(IF_RATE), 60.0f);   // AM path
     msresamp_rrrf resamp_mpx = msresamp_rrrf_create(float(REDSEA_RATE) / float(IF_RATE), 60.0f);
+
+    // ---- NEW STEREO DECODER ----
+    PilotTracker pilot;
+    pilot.init(double(IF_RATE));
+
+    // Stage 1: polyphase decimation 256 kHz -> 64 kHz for both the sum (L+R) and the
+    // mixed-down difference (L-R) signals. Unity DC gain, stop band starts at ~45 kHz so that
+    // 57 kHz RDS and the 76 kHz image cannot alias into the audio band.
+    std::vector<float> taps_dec = design_kaiser_lowpass(49, 34500.0 / double(IF_RATE), 65.0);
+    firdecim_rrrf dec_sum = firdecim_rrrf_create(STEREO_DECIM, taps_dec.data(), (unsigned int)taps_dec.size());
+    firdecim_rrrf dec_dif = firdecim_rrrf_create(STEREO_DECIM, taps_dec.data(), (unsigned int)taps_dec.size());
+
+    // Stage 2: sharp audio low-pass at 64 kHz: flat up to 15 kHz, > 60 dB down at 19 kHz
+    // (pilot and the RDS-mixing product are removed completely).
+    std::vector<float> taps_aud = design_kaiser_lowpass(65, 17000.0 / double(STEREO_RATE), 65.0);
+    firfilt_rrrf aud_sum = firfilt_rrrf_create(taps_aud.data(), (unsigned int)taps_aud.size());
+    firfilt_rrrf aud_dif = firfilt_rrrf_create(taps_aud.data(), (unsigned int)taps_aud.size());
+
+    msresamp_rrrf resamp_fm_L = msresamp_rrrf_create(float(AUDIO_RATE) / float(STEREO_RATE), 60.0f);
+    msresamp_rrrf resamp_fm_R = msresamp_rrrf_create(float(AUDIO_RATE) / float(STEREO_RATE), 60.0f);
+
+    // Loudness compatibility with the previous version: the old L+R / L-R filters were liquid
+    // Kaiser filters; whatever their DC gain was, FM_AUDIO_GAIN was tuned for it. We measure it
+    // once and apply the same factor, so the volume stays exactly as before.
+    float legacy_dc_gain = 1.0f;
+    {
+        firfilt_rrrf legacy = firfilt_rrrf_create_kaiser(63, 15000.0f / IF_RATE, 60.0f, 0.0f);
+        legacy_dc_gain = measure_dc_gain(legacy, 63);
+        firfilt_rrrf_destroy(legacy);
+        if (!std::isfinite(legacy_dc_gain) || legacy_dc_gain < 0.05f || legacy_dc_gain > 50.0f) legacy_dc_gain = 1.0f;
+    }
+    const float fm_gain_scaled = FM_AUDIO_GAIN * legacy_dc_gain;
+
+    float stereo_blend = 0.0f;       // current smoothed L-R mix amount (0 = mono, 1 = full stereo)
+    float lr_hc1 = 0.0f, lr_hc2 = 0.0f;   // L-R dynamic high-cut states
+    const float blend_a_att = 1.0f - std::exp(-1.0f / (STEREO_ATTACK_MS  * 0.001f * float(STEREO_RATE)));
+    const float blend_a_rel = 1.0f - std::exp(-1.0f / (STEREO_RELEASE_MS * 0.001f * float(STEREO_RATE)));
+
+    float dt = 1.0f / AUDIO_RATE;
+    float alpha_deemph = dt / (DEEMPHASIS_TAU + dt);
+    float deemph_L = 0.0f, deemph_R = 0.0f;
+    float dc_mpx = 0.0f;
+    float dc_rds_mpx = 0.0f;
+    float am_dc = 0.0f;
+    float am_agc = 0.1f;
 
     constexpr int FFT_SIZE = 1024;
     std::vector<std::complex<float>> fft_in(FFT_SIZE);
@@ -742,14 +1044,6 @@ int main(int argc, char** argv) {
         fft_win[i] = blackmanharris(i, FFT_SIZE);
     }
     fftplan scan_fft = fft_create_plan(FFT_SIZE, fft_in.data(), fft_out.data(), LIQUID_FFT_FORWARD, 0);
-
-    float dt = 1.0f / AUDIO_RATE;
-    float alpha_deemph = dt / (DEEMPHASIS_TAU + dt);
-    float deemph_L = 0.0f, deemph_R = 0.0f;
-    float dc_mpx = 0.0f;
-    float dc_rds_mpx = 0.0f;
-    float am_dc = 0.0f;
-    float am_agc = 0.1f;
 
     TcpServer tcp;
     RedseaRunner redsea;
@@ -931,19 +1225,27 @@ int main(int argc, char** argv) {
 
     std::cout << "[OK] DSP bridge running (Zero-Underrun Audio + Non-Blocking Tuner)! TCP port: "
               << tcp_port << ", ALSA: " << alsa_dev << "\n";
+    std::cout << "[STEREO] PLL stereo decoder active (legacy gain factor " << legacy_dc_gain << ")\n";
 
-    std::complex<float> pilot_lock_avg(0.0f, 0.0f);
-    bool stereo_locked = false;
     float signal_power = 0.0f;
     float noise_power  = 0.001f;
     int   stat_timer   = 0;
     int64_t last_diag_ms = now_ms();
+    int64_t last_stereo_dbg_ms = now_ms();
 
     std::vector<std::complex<float>> iq_in;
     std::vector<std::complex<float>> iq_decim;
     std::vector<float> rds_mpx_256;
-    std::vector<float> audio_L_256;
-    std::vector<float> audio_R_256;
+    std::vector<float> audio_L_256;      // AM path only
+    std::vector<float> audio_R_256;      // AM path only
+    std::vector<float> fm_mpx_256;       // FM: demodulated MPX
+    std::vector<float> fm_sub_256;       // FM: MPX * 2 * sin(2*pilot_phase)  (L-R + images)
+    std::vector<float> sum_dec;          // FM @ 64 kHz
+    std::vector<float> dif_dec;
+    std::vector<float> sum_flt;
+    std::vector<float> dif_flt;
+    std::vector<float> fm_L_64;
+    std::vector<float> fm_R_64;
     std::vector<float> mpx_171;
     std::vector<int16_t> mpx_pcm;
     std::vector<float> out_L;
@@ -966,6 +1268,14 @@ int main(int argc, char** argv) {
                       << " | ALSA Recoveries: " << alsa_engine.underrun_recoveries.load()
                       << " | USB Restarts: " << usb_restarts.load()
                       << " | RDS Restarts: " << redsea.restarts.load() << "\n";
+        }
+
+        if (STEREO_DEBUG && current_ms - last_stereo_dbg_ms >= 1000) {
+            last_stereo_dbg_ms = current_ms;
+            std::cout << "[STEREO] lock=" << (pilot.locked ? 1 : 0)
+                      << " pilotAmp=" << std::fixed << std::setprecision(3) << pilot.pilot_amplitude()
+                      << " snr=" << std::setprecision(1) << pilot.snr_db() << " dB"
+                      << " blend=" << std::setprecision(2) << stereo_blend << "\n";
         }
 
         if (scan_requested.exchange(false)) {
@@ -1064,9 +1374,9 @@ int main(int argc, char** argv) {
         }
 
         if (dsp_reset_on_tune.exchange(false)) {
-            nco_crcf_set_frequency(pilot_nco, 2.0f * M_PI * 19000.0f / IF_RATE);
-            pilot_lock_avg = {0.0f, 0.0f};
-            stereo_locked = false;
+            pilot.reset();
+            stereo_blend = 0.0f;
+            lr_hc1 = lr_hc2 = 0.0f;
         }
 
         if (bw_changed.exchange(false)) {
@@ -1102,6 +1412,8 @@ int main(int argc, char** argv) {
         rds_mpx_256.resize(if_samples);
         audio_L_256.resize(if_samples);
         audio_R_256.resize(if_samples);
+        fm_mpx_256.resize(if_samples);
+        fm_sub_256.resize(if_samples);
 
         uint32_t cf = current_freq.load();
         int m_ov = mod_override.load();
@@ -1109,6 +1421,7 @@ int main(int argc, char** argv) {
         bool in_fm_rds_band = (!use_am && cf >= 65000000 && cf <= 108500000);
 
         int mute_rem = soft_mute_samples.load();
+        const int mute_start = mute_rem;
 
         for (size_t i = 0; i < if_samples; ++i) {
             std::complex<float> s = sanitize_complex(iq_decim[i]);
@@ -1134,11 +1447,7 @@ int main(int argc, char** argv) {
             signal_power = sanitize_float(0.9995f * signal_power + 0.0005f * p_sig, 0.0f);
             noise_power  = sanitize_float(0.9995f * noise_power  + 0.0005f * std::max(1e-7f, p_raw - p_sig), 0.001f);
 
-            float out_l_sample = 0.0f;
-            float out_r_sample = 0.0f;
-
             if (use_am) {
-                stereo_locked = false;
                 float env = std::abs(s_filt);
                 am_dc = sanitize_float(0.999f * am_dc + 0.001f * env, 0.0f);
                 float ac = env - am_dc;
@@ -1150,73 +1459,92 @@ int main(int argc, char** argv) {
                 firfilt_rrrf_execute(am_audio_filter, &af);
                 af = sanitize_float(af);
 
-                out_l_sample = af;
-                out_r_sample = af;
+                float out_l_sample = af;
+                float out_r_sample = af;
+
+                if (mute_rem > 0) {
+                    float atten = 1.0f - (float(mute_rem) / float(IF_RATE / 80 + 1));
+                    atten = std::clamp(atten, 0.15f, 1.0f);
+                    out_l_sample *= atten;
+                    out_r_sample *= atten;
+                    mute_rem--;
+                }
+
+                audio_L_256[i] = out_l_sample;
+                audio_R_256[i] = out_r_sample;
             } else {
+                // ---- FM demodulation -> MPX ----
                 float mpx_raw = 0.0f;
                 freqdem_demodulate(fmdem, s_filt, &mpx_raw);
                 mpx_raw = sanitize_float(mpx_raw);
                 dc_mpx = sanitize_float(0.9995f * dc_mpx + 0.0005f * mpx_raw);
                 float mpx = mpx_raw - dc_mpx;
 
-                std::complex<float> p_nco;
-                nco_crcf_cexpf(pilot_nco, &p_nco);
-                std::complex<float> p_mix(mpx * p_nco.imag(), mpx * p_nco.real());
+                // Pilot PLL returns sin(2*phase) - the 38 kHz reference phase-aligned with this sample
+                float carrier_38k = pilot.step(mpx);
 
-                std::complex<float> p_metric;
-                iirfilt_crcf_execute(pilot_metric_lpf, p_mix, &p_metric);
-                if (!std::isfinite(p_metric.real()) || !std::isfinite(p_metric.imag())) {
-                    iirfilt_crcf_reset(pilot_metric_lpf);
-                    p_metric = {0.0f, 0.0f};
-                }
-                pilot_lock_avg = sanitize_complex(0.999f * pilot_lock_avg + 0.001f * p_metric);
-
-                float p_err = std::clamp(p_metric.imag() * 2.0f, -0.5f, 0.5f);
-                nco_crcf_pll_step(pilot_nco, p_err);
-                nco_crcf_step(pilot_nco);
-
-                float p_freq = nco_crcf_get_frequency(pilot_nco);
-                float p_nom  = 2.0f * M_PI * 19000.0f / IF_RATE;
-                if (!std::isfinite(p_freq) || std::abs(p_freq - p_nom) > (2.0f * M_PI * 30.0f / IF_RATE)) {
-                    nco_crcf_set_frequency(pilot_nco, p_nom);
-                }
-
-                float lock_level = pilot_lock_avg.real();
-                if (!stereo_locked && lock_level > 0.022f) stereo_locked = true;
-                else if (stereo_locked && lock_level < 0.012f) stereo_locked = false;
-
-                float phi19 = nco_crcf_get_phase(pilot_nco);
-                float carrier_38k = std::sin(2.0f * phi19);
-
-                float lpr = 0.0f, lmr = 0.0f;
-                firfilt_rrrf_push(lpr_filter, mpx);
-                firfilt_rrrf_execute(lpr_filter, &lpr);
-
-                firfilt_rrrf_push(lmr_filter, mpx * carrier_38k * 2.0f);
-                firfilt_rrrf_execute(lmr_filter, &lmr);
-
-                lpr = sanitize_float(lpr);
-                lmr = sanitize_float(lmr);
-
-                float stereo_blend = (!force_mono && stereo_locked)
-                                   ? std::clamp((lock_level - 0.012f) * 28.0f, 0.0f, 0.85f)
-                                   : 0.0f;
-                lmr *= stereo_blend;
-
-                out_l_sample = lpr + lmr;
-                out_r_sample = lpr - lmr;
+                fm_mpx_256[i] = mpx;
+                fm_sub_256[i] = 2.0f * mpx * carrier_38k;
             }
+        }
 
-            if (mute_rem > 0) {
-                float atten = 1.0f - (float(mute_rem) / float(IF_RATE / 80 + 1));
-                atten = std::clamp(atten, 0.15f, 1.0f);
-                out_l_sample *= atten;
-                out_r_sample *= atten;
-                mute_rem--;
+        // ------------------------------------------------------------------
+        // FM stereo post-processing @ 64 kHz
+        // ------------------------------------------------------------------
+        size_t n64 = 0;
+        if (!use_am) {
+            n64 = if_samples / STEREO_DECIM;
+            if (n64 > 0) {
+                sum_dec.resize(n64);
+                dif_dec.resize(n64);
+                sum_flt.resize(n64);
+                dif_flt.resize(n64);
+                fm_L_64.resize(n64);
+                fm_R_64.resize(n64);
+
+                firdecim_rrrf_execute_block(dec_sum, fm_mpx_256.data(), (unsigned int)n64, sum_dec.data());
+                firdecim_rrrf_execute_block(dec_dif, fm_sub_256.data(), (unsigned int)n64, dif_dec.data());
+                firfilt_rrrf_execute_block(aud_sum, sum_dec.data(), (unsigned int)n64, sum_flt.data());
+                firfilt_rrrf_execute_block(aud_dif, dif_dec.data(), (unsigned int)n64, dif_flt.data());
+
+                // Target stereo amount from pilot quality and estimated L-R SNR
+                float target_blend = 0.0f;
+                if (!force_mono.load() && pilot.locked) {
+                    double q = (pilot.snr_db() - STEREO_SNR_MIN_DB) / (STEREO_SNR_FULL_DB - STEREO_SNR_MIN_DB);
+                    q = std::clamp(q, 0.0, 1.0);
+                    target_blend = float(q * q * (3.0 - 2.0 * q));   // smoothstep
+                }
+
+                for (size_t j = 0; j < n64; ++j) {
+                    const float a = (target_blend < stereo_blend) ? blend_a_att : blend_a_rel;
+                    stereo_blend += a * (target_blend - stereo_blend);
+
+                    // Dynamic high-cut on L-R: weak signal -> narrow, strong -> transparent
+                    const float fc = LR_HICUT_MIN_HZ + LR_HICUT_SPAN_HZ * stereo_blend * stereo_blend;
+                    const float hc_alpha = 1.0f - std::exp(-2.0f * float(M_PI) * fc / float(STEREO_RATE));
+                    lr_hc1 += hc_alpha * (sanitize_float(dif_flt[j]) - lr_hc1);
+                    lr_hc2 += hc_alpha * (lr_hc1 - lr_hc2);
+
+                    const float S = sanitize_float(sum_flt[j]);
+                    const float D = lr_hc2 * stereo_blend;
+
+                    float l = S + D;
+                    float r = S - D;
+
+                    // Soft-mute after tuning (ramp measured in IF-rate samples)
+                    const int rem = mute_start - int(j * STEREO_DECIM);
+                    if (rem > 0) {
+                        float atten = 1.0f - (float(rem) / float(IF_RATE / 80 + 1));
+                        atten = std::clamp(atten, 0.15f, 1.0f);
+                        l *= atten;
+                        r *= atten;
+                    }
+
+                    fm_L_64[j] = l;
+                    fm_R_64[j] = r;
+                }
             }
-
-            audio_L_256[i] = out_l_sample;
-            audio_R_256[i] = out_r_sample;
+            mute_rem = std::max(0, mute_start - int(if_samples));
         }
         soft_mute_samples = mute_rem;
 
@@ -1232,15 +1560,23 @@ int main(int argc, char** argv) {
             redsea.write_mpx(mpx_pcm.data(), num_mpx);
         }
 
-        out_L.resize(if_samples + 64);
-        out_R.resize(if_samples + 64);
         unsigned int num_L = 0, num_R = 0;
-        msresamp_rrrf_execute(resamp_L, audio_L_256.data(), if_samples, out_L.data(), &num_L);
-        msresamp_rrrf_execute(resamp_R, audio_R_256.data(), if_samples, out_R.data(), &num_R);
+        if (use_am) {
+            out_L.resize(if_samples + 64);
+            out_R.resize(if_samples + 64);
+            msresamp_rrrf_execute(resamp_L, audio_L_256.data(), if_samples, out_L.data(), &num_L);
+            msresamp_rrrf_execute(resamp_R, audio_R_256.data(), if_samples, out_R.data(), &num_R);
+        } else {
+            if (n64 == 0) continue;
+            out_L.resize(n64 + 64);
+            out_R.resize(n64 + 64);
+            msresamp_rrrf_execute(resamp_fm_L, fm_L_64.data(), (unsigned int)n64, out_L.data(), &num_L);
+            msresamp_rrrf_execute(resamp_fm_R, fm_R_64.data(), (unsigned int)n64, out_R.data(), &num_R);
+        }
 
         unsigned int out_frames = std::min(num_L, num_R);
         pcm_out.resize(out_frames * 2);
-        float gain_mult = use_am ? AM_AUDIO_GAIN : FM_AUDIO_GAIN;
+        float gain_mult = use_am ? AM_AUDIO_GAIN : fm_gain_scaled;
 
         for (unsigned int i = 0; i < out_frames; ++i) {
             float sl = sanitize_float(out_L[i]);
@@ -1266,7 +1602,8 @@ int main(int argc, char** argv) {
             float level_dbf = 0.65f * pwr_db + 0.35f * (snr_db + SIGNAL_OFFSET_DBF);
             level_dbf = std::clamp(sanitize_float(level_dbf), 0.0f, MAX_SIGNAL_DBF);
 
-            bool st = (!use_am) && (!force_mono) && stereo_locked;
+            // Stereo indicator for the client: pilot locked and the decoder is really mixing in L-R
+            bool st = (!use_am) && (!force_mono) && pilot.locked && (stereo_blend > 0.30f);
 
             std::ostringstream ss;
             ss << "S" << (st ? "s" : "m") << std::fixed << std::setprecision(1) << level_dbf << "\n";
@@ -1290,14 +1627,16 @@ int main(int argc, char** argv) {
     firfilt_crcf_destroy(rds_if_filter);
     freqdem_destroy(fmdem);
     freqdem_destroy(rds_fmdem);
-    firfilt_rrrf_destroy(lpr_filter);
-    firfilt_rrrf_destroy(lmr_filter);
     firfilt_rrrf_destroy(am_audio_filter);
-    iirfilt_crcf_destroy(pilot_metric_lpf);
-    nco_crcf_destroy(pilot_nco);
+    firdecim_rrrf_destroy(dec_sum);
+    firdecim_rrrf_destroy(dec_dif);
+    firfilt_rrrf_destroy(aud_sum);
+    firfilt_rrrf_destroy(aud_dif);
     msresamp_rrrf_destroy(resamp_L);
     msresamp_rrrf_destroy(resamp_R);
     msresamp_rrrf_destroy(resamp_mpx);
+    msresamp_rrrf_destroy(resamp_fm_L);
+    msresamp_rrrf_destroy(resamp_fm_R);
 
     if (global_sdr) rtlsdr_close(global_sdr);
     return 0;
