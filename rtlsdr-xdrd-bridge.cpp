@@ -115,8 +115,8 @@ constexpr double   PILOT_LOCK_OFF_AMP      = 0.028;
 //   above STEREO_SNR_FULL_DB -> full stereo
 // If weak stations still hiss  -> raise both numbers (e.g. 22 / 34).
 // If stereo drops too early    -> lower them   (e.g. 14 / 26).
-constexpr double   STEREO_SNR_MIN_DB       = 10.0;
-constexpr double   STEREO_SNR_FULL_DB      = 22.0;
+constexpr double   STEREO_SNR_MIN_DB       = 6.0;
+constexpr double   STEREO_SNR_FULL_DB      = 17.0;
 
 // Blend smoothing: fast fall (to mono), slow rise (to stereo) - prevents "pumping"
 constexpr float    STEREO_ATTACK_MS        = 20.0f;
@@ -511,6 +511,13 @@ class RedseaRunner {
     std::mutex proc_mtx;
     std::atomic<int64_t> ignore_until_ms{0};
 
+    // Byte-exact, sample-aligned non-blocking writer state (touched only by the DSP thread,
+    // except tx_reset which is raised by the thread that respawns redsea)
+    std::vector<uint8_t> tx_buf;
+    bool pipe_mid_sample = false;          // true if an odd number of bytes was already sent to the pipe
+    std::atomic<bool> tx_reset{false};
+    static constexpr size_t TX_CAP_BYTES = 32768;
+
     bool spawn() {
         close_pipes();
         if (pipe(pipe_stdin) < 0 || pipe(pipe_stdout) < 0) {
@@ -535,6 +542,9 @@ class RedseaRunner {
             close(pipe_stdin[0]); close(pipe_stdin[1]);
             close(pipe_stdout[0]); close(pipe_stdout[1]);
 
+            // do not leak sockets / USB / ALSA descriptors into redsea
+            for (int fd = 3; fd < 1024; ++fd) close(fd);
+
             setenv("PATH", "/usr/local/bin:/usr/bin:/bin", 1);
 
             execlp("stdbuf", "stdbuf", "-oL", "redsea", "-r", "171000", "-x", nullptr);
@@ -551,6 +561,7 @@ class RedseaRunner {
         if (flags >= 0) fcntl(pipe_stdin[1], F_SETFL, flags | O_NONBLOCK);
 
         pid = cpid;
+        tx_reset = true;
         return true;
     }
 
@@ -577,6 +588,8 @@ class RedseaRunner {
 public:
     std::function<void(const std::string&, const std::string&, const std::string&, const std::string&)> on_rds_hex;
     std::atomic<uint64_t> restarts{0};
+    std::atomic<uint64_t> dropped_bytes{0};
+    std::atomic<uint64_t> partial_writes{0};
 
     bool start() {
         std::lock_guard<std::mutex> lock(proc_mtx);
@@ -593,15 +606,42 @@ public:
         int wfd = pipe_stdin[1];
         if (wfd < 0 || samples == 0) return;
 
-        if (now_ms() < ignore_until_ms.load()) {
-            static const std::vector<int16_t> zero_mpx(4096, 0);
-            size_t to_write = std::min(samples, zero_mpx.size());
-            ssize_t unused = write(wfd, zero_mpx.data(), to_write * sizeof(int16_t));
-            (void)unused;
-            return;
+        if (tx_reset.exchange(false)) {
+            tx_buf.clear();
+            pipe_mid_sample = false;
         }
-        ssize_t unused = write(wfd, data, samples * sizeof(int16_t));
-        (void)unused;
+
+        static const std::vector<int16_t> zero_mpx(4096, 0);
+        const int16_t* src = data;
+        size_t n = samples;
+        if (now_ms() < ignore_until_ms.load()) {
+            src = zero_mpx.data();
+            n = std::min(samples, zero_mpx.size());
+        }
+
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(src);
+        tx_buf.insert(tx_buf.end(), b, b + n * sizeof(int16_t));
+
+        // Push as much as the pipe accepts. A partial write may end in the middle of an int16
+        // sample; the remainder stays in tx_buf and is sent first next time, so the byte stream
+        // seen by redsea never loses 16-bit alignment.
+        while (!tx_buf.empty()) {
+            ssize_t w = write(wfd, tx_buf.data(), tx_buf.size());
+            if (w <= 0) break;
+            if (size_t(w) < tx_buf.size()) partial_writes++;
+            tx_buf.erase(tx_buf.begin(), tx_buf.begin() + w);
+            if (w & 1) pipe_mid_sample = !pipe_mid_sample;
+        }
+
+        // redsea is too slow / blocked: drop the oldest WHOLE samples, never half a sample
+        if (tx_buf.size() > TX_CAP_BYTES) {
+            size_t head   = pipe_mid_sample ? 1 : 0;       // keep the pending second byte
+            size_t excess = (tx_buf.size() - TX_CAP_BYTES) & ~size_t(1);
+            if (excess > 0) {
+                tx_buf.erase(tx_buf.begin() + head, tx_buf.begin() + head + excess);
+                dropped_bytes += excess;
+            }
+        }
     }
 
     void stop() {
@@ -820,12 +860,14 @@ std::mutex iq_mtx;
 std::condition_variable iq_cv;
 std::deque<std::vector<uint8_t>> iq_queue;
 std::atomic<int64_t> last_usb_packet_ms{0};
+std::atomic<uint64_t> iq_drops{0};
 
 void rtlsdr_callback(unsigned char* buf, uint32_t len, void* /*ctx*/) {
     if (!running || len == 0) return;
     last_usb_packet_ms = now_ms();
     std::lock_guard<std::mutex> lock(iq_mtx);
     if (iq_queue.size() >= MAX_IQ_QUEUE_SIZE) {
+        iq_drops++;
         iq_queue.pop_front();
     }
     iq_queue.emplace_back(buf, buf + len);
@@ -1267,7 +1309,10 @@ int main(int argc, char** argv) {
                       << " | AudioRing: " << int(alsa_engine.get_fill_ratio() * 100.0) << "%"
                       << " | ALSA Recoveries: " << alsa_engine.underrun_recoveries.load()
                       << " | USB Restarts: " << usb_restarts.load()
-                      << " | RDS Restarts: " << redsea.restarts.load() << "\n";
+                      << " | RDS Restarts: " << redsea.restarts.load()
+                      << " | RDS dropped: " << (redsea.dropped_bytes.load() / 1024) << " KB"
+                      << " (partial writes: " << redsea.partial_writes.load() << ")"
+                      << " | IQ drops: " << iq_drops.load() << "\n";
         }
 
         if (STEREO_DEBUG && current_ms - last_stereo_dbg_ms >= 1000) {
